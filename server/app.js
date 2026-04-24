@@ -8,12 +8,18 @@ function sendPublicFile(response, fileName) {
   response.sendFile(path.join(__dirname, "..", "public", fileName));
 }
 
-function createSessionId() {
-  return `SESSION-${Math.random().toString(36).slice(2, 10)}-${Date.now()}`;
+const crypto = require("crypto");
+
+function createSessionId() { //generate a unique session ID
+  return `SESSION-${crypto.randomBytes(16).toString("hex")}-${Date.now()}`;
 }
 
-async function createApp() {
-  if (!fs.existsSync(DEFAULT_DB_FILE)) {
+function createCsrfToken() { //Generate a CRSF token with a random component and timestamp to ensure uniqueness and unpredictability
+  return `CSRF-${crypto.randomBytes(16).toString("hex")}-${Date.now()}`;
+}
+
+async function createApp(databaseFile = DEFAULT_DB_FILE) {
+  if (!fs.existsSync(DEFAULT_DB_FILE)) { //ensure the database file exists before starting the app
     throw new Error(
       `Database file not found at ${DEFAULT_DB_FILE}. Run "npm run init-db" first.`
     );
@@ -30,9 +36,18 @@ async function createApp() {
 
   app.use(async (request, response, next) => {
     const sessionId = request.cookies.sid;
+    const csrfCookie = request.cookies.csrf;
 
-    if (!sessionId) {
+    if (!sessionId) { //if no session cookie is present, treat as logged out user
       request.currentUser = null;
+      request.csrfToken = csrfCookie || createCsrfToken();
+      if (!csrfCookie) { //set CSRF cookie if it was not present in the request to ensure the client has it for future requests
+        response.cookie("csrf", request.csrfToken, {
+          sameSite: "strict",
+          secure: process.env.NODE_ENV === "production",
+          path: "/"
+        });
+      }
       next();
       return;
     }
@@ -41,6 +56,7 @@ async function createApp() {
       `
         SELECT
           sessions.id AS session_id,
+          sessions.csrf_token AS csrf_token,
           users.id AS id,
           users.username AS username,
           users.role AS role,
@@ -62,12 +78,36 @@ async function createApp() {
         }
       : null;
 
+    request.csrfToken = row?.csrf_token || csrfCookie || createCsrfToken();
+    if (!row?.csrf_token) {
+      await db.run("UPDATE sessions SET csrf_token = ? WHERE id = ?", [request.csrfToken, sessionId]);
+    }
+    if (!csrfCookie) {
+      response.cookie("csrf", request.csrfToken, {
+        sameSite: "strict",
+        secure: process.env.NODE_ENV === "production",
+        path: "/"
+      });
+    }
     next();
   });
 
   function requireAuth(request, response, next) {
     if (!request.currentUser) {
       response.status(401).json({ error: "Authentication required." });
+      return;
+    }
+
+    next();
+  }
+
+  function requireCsrf(request, response, next) { //require CSRF token to be present
+
+    const token = request.headers['x-csrf-token'] || request.body.csrfToken;
+    const expectedToken = request.csrfToken;
+
+    if (!token || token !== expectedToken) {
+      response.status(403).json({ error: "CSRF token validation failed." });
       return;
     }
 
@@ -81,34 +121,38 @@ async function createApp() {
   app.get("/admin", (_request, response) => sendPublicFile(response, "admin.html"));
 
   app.get("/api/me", (request, response) => {
-    response.json({ user: request.currentUser });
+  
+    response.json({ user: request.currentUser, csrfToken: request.csrfToken });
   });
 
   app.post("/api/login", async (request, response) => {
     const username = String(request.body.username || "");
     const password = String(request.body.password || "");
 
-    const query = `
-      SELECT id, username, role, display_name
-      FROM users
-      WHERE username = '${username}' AND password = '${password}'
-    `;
-    const user = await db.get(query);
+    const user = await db.get(
+      "SELECT id, username, role, display_name FROM users WHERE username = ? AND password = ?",
+      [username, password]
+    );
 
     if (!user) {
       response.status(401).json({ error: "Invalid username or password." });
       return;
     }
 
-    const sessionId = request.cookies.sid || createSessionId();
 
-    await db.run("DELETE FROM sessions WHERE id = ?", [sessionId]);
+    const sessionId = createSessionId(); //create a new session for the user and store it in the database, ensuring any existing sessions for the user are removed to prevent multiple active sessions
+
+    await db.run("DELETE FROM sessions WHERE user_id = ?", [user.id]);
     await db.run(
-      "INSERT INTO sessions (id, user_id, created_at) VALUES (?, ?, ?)",
-      [sessionId, user.id, new Date().toISOString()]
+      "INSERT INTO sessions (id, user_id, created_at, csrf_token) VALUES (?, ?, ?, ?)",
+      [sessionId, user.id, new Date().toISOString(), request.csrfToken]
     );
 
-    response.cookie("sid", sessionId, {
+
+    response.cookie("sid", sessionId, { //set session cookie
+      httpOnly: true,  // Prevents JavaScript access to cookies
+      secure: false,   // Set to true in production with HTTPS
+      sameSite: "strict", // Protects against CSRF
       path: "/"
     });
 
@@ -132,9 +176,17 @@ async function createApp() {
     response.json({ ok: true });
   });
 
-  app.get("/api/notes", requireAuth, async (request, response) => {
-    const ownerId = request.query.ownerId || request.currentUser.id;
-    const search = request.query.search || "";
+  app.get("/api/notes", requireAuth, async (request, response) => { //Fetch notes (owner or asmin only)
+    const ownerId = Number(request.query.ownerId || request.currentUser.id);
+    
+
+    if (ownerId !== request.currentUser.id && request.currentUser.role !== 'admin') { //Enforce access control
+      response.status(403).json({ error: "Access denied." });
+      return;
+    }
+    
+    const search = String(request.query.search || "");
+
 
     const notes = await db.all(`
       SELECT
@@ -147,19 +199,20 @@ async function createApp() {
         notes.created_at AS createdAt
       FROM notes
       JOIN users ON users.id = notes.owner_id
-      WHERE notes.owner_id = ${ownerId}
-        AND (notes.title LIKE '%${search}%' OR notes.body LIKE '%${search}%')
+      WHERE notes.owner_id = ?
+        AND (notes.title LIKE ? OR notes.body LIKE ?)
       ORDER BY notes.pinned DESC, notes.id DESC
-    `);
+    `, [ownerId, `%${search}%`, `%${search}%`]);
 
     response.json({ notes });
   });
 
-  app.post("/api/notes", requireAuth, async (request, response) => {
-    const ownerId = Number(request.body.ownerId || request.currentUser.id);
+  app.post("/api/notes", requireAuth, requireCsrf, async (request, response) => { //Create a new note
     const title = String(request.body.title || "");
     const body = String(request.body.body || "");
     const pinned = request.body.pinned ? 1 : 0;
+
+    const ownerId = request.currentUser.id;
 
     const result = await db.run(
       "INSERT INTO notes (owner_id, title, body, pinned, created_at) VALUES (?, ?, ?, ?, ?)",
@@ -172,8 +225,13 @@ async function createApp() {
     });
   });
 
-  app.get("/api/settings", requireAuth, async (request, response) => {
+  app.get("/api/settings", requireAuth, async (request, response) => { //Fetch settings for the current user or specified user (admin only)
     const userId = Number(request.query.userId || request.currentUser.id);
+    
+    if (userId !== request.currentUser.id && request.currentUser.role !== 'admin') {
+      response.status(403).json({ error: "Access denied." });
+      return;
+    }
 
     const settings = await db.get(
       `
@@ -195,12 +253,14 @@ async function createApp() {
     response.json({ settings });
   });
 
-  app.post("/api/settings", requireAuth, async (request, response) => {
-    const userId = Number(request.body.userId || request.currentUser.id);
+  app.post("/api/settings", requireAuth, requireCsrf, async (request, response) => { //Update settings
     const displayName = String(request.body.displayName || "");
     const statusMessage = String(request.body.statusMessage || "");
     const theme = String(request.body.theme || "classic");
     const emailOptIn = request.body.emailOptIn ? 1 : 0;
+
+   
+    const userId = request.currentUser.id;
 
     await db.run("UPDATE users SET display_name = ? WHERE id = ?", [displayName, userId]);
     await db.run(
@@ -211,7 +271,7 @@ async function createApp() {
     response.json({ ok: true });
   });
 
-  app.get("/api/settings/toggle-email", requireAuth, async (request, response) => {
+  app.get("/api/settings/toggle-email", requireAuth, requireCsrf, async (request, response) => { //Toggle email opt-in
     const enabled = request.query.enabled === "1" ? 1 : 0;
 
     await db.run("UPDATE settings SET email_opt_in = ? WHERE user_id = ?", [
@@ -226,7 +286,13 @@ async function createApp() {
     });
   });
 
-  app.get("/api/admin/users", requireAuth, async (_request, response) => {
+  app.get("/api/admin/users", requireAuth, async (request, response) => { //Fetch all users (admin only)
+
+    if (request.currentUser.role !== 'admin') {
+      response.status(403).json({ error: "Admin access required." });
+      return;
+    }
+
     const users = await db.all(`
       SELECT
         users.id,

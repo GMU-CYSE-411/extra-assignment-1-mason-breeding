@@ -1,14 +1,25 @@
-function noteCard(note) {
-  return `
-    <article class="note-card">
-      <h3>${note.title}</h3>
-      <p class="note-meta">Owner: ${note.ownerUsername} | ID: ${note.id} | Pinned: ${note.pinned}</p>
-      <div class="note-body">${note.body}</div>
-    </article>
-  `;
+function noteCard(note) { // Create a DOM element for a note card
+  const article = document.createElement('article');
+  article.className = 'note-card';
+
+  const title = document.createElement('h3');
+  title.textContent = note.title;
+  article.appendChild(title);
+
+  const meta = document.createElement('p');
+  meta.className = 'note-meta';
+  meta.textContent = `Owner: ${note.ownerUsername} | ID: ${note.id} | Pinned: ${note.pinned}`;
+  article.appendChild(meta);
+
+  const body = document.createElement('div');
+  body.className = 'note-body';
+  body.textContent = note.body;
+  article.appendChild(body);
+
+  return article.outerHTML;
 }
 
-async function loadNotes(ownerId, search) {
+async function loadNotes(ownerId, search) { //Fetch notes from the sever and render them in the "notes-list" element
   const query = new URLSearchParams();
 
   if (ownerId) {
@@ -19,16 +30,18 @@ async function loadNotes(ownerId, search) {
     query.set("search", search);
   }
 
-  const result = await api(`/api/notes?${query.toString()}`);
+  const result = await api(`/api/notes?${query.toString()}`); //Request filitered notes
   const notesList = document.getElementById("notes-list");
-  notesList.innerHTML = result.notes.map(noteCard).join("");
+
+  notesList.innerHTML = '';  //clear existing content
+  result.notes.forEach(note => notesList.appendChild(noteCard(note)));
 }
 
 (async function bootstrapNotes() {
   try {
     const user = await loadCurrentUser();
 
-    if (!user) {
+    if (!user) { //Require login to view notes
       document.getElementById("notes-list").textContent = "Please log in first.";
       return;
     }
@@ -41,14 +54,13 @@ async function loadNotes(ownerId, search) {
   }
 })();
 
-document.getElementById("search-form").addEventListener("submit", async (event) => {
-  event.preventDefault();
+document.getElementById("search-form").addEventListener("submit", async (event) => { 
 
   const formData = new FormData(event.currentTarget);
   await loadNotes(formData.get("ownerId"), formData.get("search"));
 });
 
-document.getElementById("create-note-form").addEventListener("submit", async (event) => {
+document.getElementById("create-note-form").addEventListener("submit", async (event) => { //handle note creation form submission
   event.preventDefault();
 
   const formData = new FormData(event.currentTarget);

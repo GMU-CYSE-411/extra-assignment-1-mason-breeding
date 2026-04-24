@@ -1,25 +1,19 @@
 (function setupFixationHelper() {
-  const params = new URLSearchParams(window.location.search);
-  const fixedSession = params.get("sid");
-
-  if (fixedSession) {
-    document.cookie = `sid=${fixedSession}; path=/`;
-  }
 })();
 
-document.getElementById("login-form").addEventListener("submit", async (event) => {
-  event.preventDefault();
+document.getElementById("login-form").addEventListener("submit", async (event) => { 
+  event.preventDefault(); // prevents page reload
 
   const formData = new FormData(event.currentTarget);
   const payload = Object.fromEntries(formData.entries());
 
   try {
-    const result = await api("/api/login", {
+    const result = await api("/api/login", { //send login request to the backend API
       method: "POST",
       body: JSON.stringify(payload)
     });
 
-    writeJson("login-output", result);
+    writeJson("login-output", result); //display the result of the login attempt in the "login-output" element
   } catch (error) {
     writeJson("login-output", { error: error.message });
   }

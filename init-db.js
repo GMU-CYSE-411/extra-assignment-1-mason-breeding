@@ -27,6 +27,7 @@ async function initializeDatabase() {
       id TEXT PRIMARY KEY,
       user_id INTEGER NOT NULL,
       created_at TEXT NOT NULL,
+      csrf_token TEXT,
       FOREIGN KEY(user_id) REFERENCES users(id)
     )
   `);
